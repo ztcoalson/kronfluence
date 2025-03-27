@@ -60,6 +60,7 @@ class Analyzer(FactorComputer, ScoreComputer):
         disable_tqdm: bool = False,
         output_dir: str = "./influence_results",
         disable_model_save: bool = True,
+        normalize_scores: bool = False,
     ) -> None:
         """Initializes an instance of the `Analyzer` class.
 
@@ -99,6 +100,7 @@ class Analyzer(FactorComputer, ScoreComputer):
             profile=profile,
             disable_tqdm=disable_tqdm,
             output_dir=output_dir,
+            normalize_scores=normalize_scores,
         )
         self.logger.info(f"Initializing `Analyzer` with parameters: {locals()}")
         self.logger.info(f"Process state configuration:\n{repr(self.state)}")

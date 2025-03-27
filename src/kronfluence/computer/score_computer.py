@@ -79,6 +79,7 @@ class ScoreComputer(Computer):
         self,
         scores_name: str,
         score_args: ScoreArguments,
+        num_query_tokens: int,
         exist_fnc: Callable,
         load_fnc: Callable,
         save_fnc: Callable,
@@ -132,6 +133,7 @@ class ScoreComputer(Computer):
                             ),
                             dim=dim,
                         )
+
         save_fnc(output_dir=scores_output_dir, scores=aggregated_scores, metadata=score_args.to_str_dict())
         end_time = time.time()
         elapsed_time = end_time - start_time
@@ -231,6 +233,8 @@ class ScoreComputer(Computer):
         target_data_partitions: Optional[Sequence[int]] = None,
         target_module_partitions: Optional[Sequence[int]] = None,
         overwrite_output_dir: bool = False,
+        normalize_scores: bool = False,
+        normalization_factor: Optional[float] = None,
     ) -> Optional[SCORE_TYPE]:
         """Computes pairwise influence scores with the given score configuration.
 
@@ -440,6 +444,11 @@ class ScoreComputer(Computer):
                 elapsed_time = end_time - start_time
                 self.logger.info(f"Computed pairwise influence scores in {elapsed_time:.2f} seconds.")
 
+                if normalize_scores and score_args.aggregate_query_gradients:
+                    self.logger.info(f"Normalizing scores by provided factor: {normalization_factor}.")
+                    for module_name in scores.keys():
+                        scores[module_name] /= normalization_factor
+
                 with self.profiler.profile("Save Pairwise Score"):
                     if self.state.is_main_process:
                         save_pairwise_scores(
@@ -457,7 +466,7 @@ class ScoreComputer(Computer):
         elapsed_time = all_end_time - all_start_time
         if not no_partition:
             self.logger.info(f"Fitted all partitioned pairwise scores in {elapsed_time:.2f} seconds.")
-            if self.state.is_main_process:
+            if self.state.is_main_process:                                         # compute the number of tokens in the query dataset for normalization
                 self.aggregate_pairwise_scores(scores_name=scores_name)
                 self.logger.info(f"Saved aggregated pairwise scores at `{scores_output_dir}`.")
             self.state.wait_for_everyone()
@@ -471,6 +480,8 @@ class ScoreComputer(Computer):
         Args:
             scores_name (str):
                 The unique identifier for the score, used to organize and retrieve the results.
+            num_query_tokens (int):
+                The number of query tokens in the query dataset. This is used to normalize the scores.
         """
         score_args = self.load_score_args(scores_name=scores_name)
         if score_args is None:
