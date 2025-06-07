@@ -69,6 +69,7 @@ class Computer(ABC):
         log_main_process_only: bool = True,
         profile: bool = False,
         disable_tqdm: bool = False,
+        normalize_scores: bool = False,
     ) -> None:
         """Initializes an instance of the `Computer` class. See `Analyzer` for more information."""
         self.state = State(cpu=cpu)
@@ -79,6 +80,7 @@ class Computer(ABC):
 
         self.model = model
         self.task = task
+        self.normalize_scores = normalize_scores
 
         tracked_module_names = get_tracked_module_names(self.model)
         if len(tracked_module_names) == 0:

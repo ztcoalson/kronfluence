@@ -4,7 +4,7 @@ import torch
 import torch.distributed as dist
 from accelerate.utils import send_to_device
 from torch import autocast, nn
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 from torch.utils import data
 from tqdm import tqdm
 

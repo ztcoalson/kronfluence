@@ -3,7 +3,7 @@ import os
 from setuptools import find_packages, setup
 
 version = {}
-with open("kronfluence/version.py") as fp:
+with open("src/kronfluence/version.py") as fp:
     exec(fp.read(), version)
 
 __version__ = version["__version__"]
@@ -35,7 +35,8 @@ if __name__ == "__main__":
         extras_require={
             "dev": dev_required,
         },
-        packages=find_packages(),
+        packages=find_packages(where="src"),
+        package_dir={"": "src"},
         keywords=[
             "Training Data Attribution",
             "Influence Functions",

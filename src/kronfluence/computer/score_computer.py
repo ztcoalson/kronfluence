@@ -10,6 +10,7 @@ from kronfluence.arguments import FactorArguments, ScoreArguments
 from kronfluence.computer.computer import Computer
 from kronfluence.score.pairwise import (
     compute_pairwise_query_aggregated_scores_with_loaders,
+    compute_pairwise_dual_query_aggregated_scores_with_loaders,
     compute_pairwise_scores_with_loaders,
     load_pairwise_scores,
     pairwise_scores_exist,
@@ -79,6 +80,7 @@ class ScoreComputer(Computer):
         self,
         scores_name: str,
         score_args: ScoreArguments,
+        num_query_tokens: int,
         exist_fnc: Callable,
         load_fnc: Callable,
         save_fnc: Callable,
@@ -132,6 +134,7 @@ class ScoreComputer(Computer):
                             ),
                             dim=dim,
                         )
+
         save_fnc(output_dir=scores_output_dir, scores=aggregated_scores, metadata=score_args.to_str_dict())
         end_time = time.time()
         elapsed_time = end_time - start_time
@@ -222,9 +225,11 @@ class ScoreComputer(Computer):
         query_dataset: data.Dataset,
         train_dataset: data.Dataset,
         per_device_query_batch_size: int,
+        negative_query_dataset: Optional[data.Dataset] = None,
         per_device_train_batch_size: Optional[int] = None,
         initial_per_device_train_batch_size_attempt: int = 4096,
         query_indices: Optional[Sequence[int]] = None,
+        negative_query_indices: Optional[Sequence[int]] = None,
         train_indices: Optional[Sequence[int]] = None,
         dataloader_kwargs: Optional[DataLoaderKwargs] = None,
         score_args: Optional[ScoreArguments] = None,
@@ -241,6 +246,10 @@ class ScoreComputer(Computer):
                 The name of the factor to use for influence computations.
             query_dataset (data.Dataset):
                 The query dataset, typically much smaller than the training dataset.
+            negative_query_dataset (data.Dataset, optional):
+                An optional second query dataset. If provided, its aggregated
+                gradients are subtracted from those of ``query_dataset`` before
+                computing pairwise scores.
             train_dataset (data.Dataset):
                 The training dataset.
             per_device_query_batch_size (int):
@@ -253,6 +262,9 @@ class ScoreComputer(Computer):
             query_indices (Sequence[int], optional):
                 The specific indices of the query dataset to compute the influence scores for. If not specified,
                 all query data points will be used.
+            negative_query_indices (Sequence[int], optional):
+                The specific indices of ``negative_query_dataset`` to compute the influence scores for. If not
+                specified, all data points from ``negative_query_dataset`` will be used.
             train_indices (Sequence[int], optional):
                 The specific indices of the training dataset to compute the influence scores for. If not
                 specified, all training data points will be used.
@@ -283,6 +295,10 @@ class ScoreComputer(Computer):
             factors_name=factors_name,
             overwrite_output_dir=overwrite_output_dir,
         )
+
+        if negative_query_dataset is not None and not score_args.aggregate_query_gradients:
+            self.logger.info("`negative_query_dataset` provided; setting `aggregate_query_gradients=True`.")
+            score_args.aggregate_query_gradients = True
 
         if score_args.compute_per_token_scores and score_args.aggregate_train_gradients:
             warning_msg = (
@@ -317,6 +333,14 @@ class ScoreComputer(Computer):
                 output_dir=scores_output_dir,
                 overwrite_output_dir=overwrite_output_dir,
             )
+            if negative_query_dataset is not None:
+                self._save_dataset_metadata(
+                    dataset_name="negative_query",
+                    dataset=negative_query_dataset,
+                    indices=negative_query_indices,
+                    output_dir=scores_output_dir,
+                    overwrite_output_dir=overwrite_output_dir,
+                )
             self._save_dataset_metadata(
                 dataset_name="train",
                 dataset=train_dataset,
@@ -327,6 +351,10 @@ class ScoreComputer(Computer):
         if query_indices is not None:
             query_dataset = data.Subset(dataset=query_dataset, indices=query_indices)
             del query_indices
+
+        if negative_query_dataset is not None and negative_query_indices is not None:
+            negative_query_dataset = data.Subset(dataset=negative_query_dataset, indices=negative_query_indices)
+            del negative_query_indices
 
         if train_indices is not None:
             train_dataset = data.Subset(dataset=train_dataset, indices=train_indices)
@@ -410,6 +438,13 @@ class ScoreComputer(Computer):
                         dataloader_params=dataloader_params,
                         allow_duplicates=not score_args.aggregate_query_gradients,
                     )
+                    if negative_query_dataset is not None:
+                        negative_query_loader = self._get_dataloader(
+                            dataset=negative_query_dataset,
+                            per_device_batch_size=per_device_query_batch_size,
+                            dataloader_params=dataloader_params,
+                            allow_duplicates=not score_args.aggregate_query_gradients,
+                        )
                     train_loader = self._get_dataloader(
                         dataset=train_dataset,
                         per_device_batch_size=per_device_train_batch_size,
@@ -418,24 +453,41 @@ class ScoreComputer(Computer):
                         allow_duplicates=not score_args.aggregate_train_gradients,
                         stack=not score_args.aggregate_train_gradients,
                     )
-                    func = (
-                        compute_pairwise_scores_with_loaders
-                        if not score_args.aggregate_query_gradients
-                        else compute_pairwise_query_aggregated_scores_with_loaders
-                    )
-                    scores = func(
-                        model=self.model,
-                        state=self.state,
-                        task=self.task,
-                        loaded_factors=loaded_factors,
-                        query_loader=query_loader,
-                        train_loader=train_loader,
-                        per_device_query_batch_size=per_device_query_batch_size,
-                        score_args=score_args,
-                        factor_args=factor_args,
-                        tracked_module_names=module_partition_names[module_partition],
-                        disable_tqdm=self.disable_tqdm,
-                    )
+                    if negative_query_dataset is not None:
+                        func = compute_pairwise_dual_query_aggregated_scores_with_loaders
+                        scores = func(
+                            model=self.model,
+                            state=self.state,
+                            task=self.task,
+                            loaded_factors=loaded_factors,
+                            pos_query_loader=query_loader,
+                            neg_query_loader=negative_query_loader,
+                            train_loader=train_loader,
+                            score_args=score_args,
+                            factor_args=factor_args,
+                            tracked_module_names=module_partition_names[module_partition],
+                            disable_tqdm=self.disable_tqdm,
+                            per_device_query_batch_size=per_device_query_batch_size,
+                        )
+                    else:
+                        func = (
+                            compute_pairwise_scores_with_loaders
+                            if not score_args.aggregate_query_gradients
+                            else compute_pairwise_query_aggregated_scores_with_loaders
+                        )
+                        scores = func(
+                            model=self.model,
+                            state=self.state,
+                            task=self.task,
+                            loaded_factors=loaded_factors,
+                            query_loader=query_loader,
+                            train_loader=train_loader,
+                            per_device_query_batch_size=per_device_query_batch_size,
+                            score_args=score_args,
+                            factor_args=factor_args,
+                            tracked_module_names=module_partition_names[module_partition],
+                            disable_tqdm=self.disable_tqdm,
+                        )
                 end_time = get_time(state=self.state)
                 elapsed_time = end_time - start_time
                 self.logger.info(f"Computed pairwise influence scores in {elapsed_time:.2f} seconds.")
@@ -449,6 +501,8 @@ class ScoreComputer(Computer):
                             metadata=score_args.to_str_dict(),
                         )
                     self.state.wait_for_everyone()
+                if negative_query_dataset is not None:
+                    del negative_query_loader
                 del scores, query_loader, train_loader
                 self._reset_memory()
                 self.logger.info(f"Saved pairwise scores at {scores_output_dir}.")
@@ -457,7 +511,7 @@ class ScoreComputer(Computer):
         elapsed_time = all_end_time - all_start_time
         if not no_partition:
             self.logger.info(f"Fitted all partitioned pairwise scores in {elapsed_time:.2f} seconds.")
-            if self.state.is_main_process:
+            if self.state.is_main_process:  # compute the number of tokens in the query dataset for normalization
                 self.aggregate_pairwise_scores(scores_name=scores_name)
                 self.logger.info(f"Saved aggregated pairwise scores at `{scores_output_dir}`.")
             self.state.wait_for_everyone()
@@ -471,6 +525,8 @@ class ScoreComputer(Computer):
         Args:
             scores_name (str):
                 The unique identifier for the score, used to organize and retrieve the results.
+            num_query_tokens (int):
+                The number of query tokens in the query dataset. This is used to normalize the scores.
         """
         score_args = self.load_score_args(scores_name=scores_name)
         if score_args is None:

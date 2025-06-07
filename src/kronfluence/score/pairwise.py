@@ -5,12 +5,12 @@ import torch
 from accelerate.utils import send_to_device
 from safetensors.torch import load_file, save_file
 from torch import autocast, nn
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 from torch.utils import data
 from tqdm import tqdm
 
 from kronfluence.arguments import FactorArguments, ScoreArguments
-from kronfluence.module.tracked_module import ModuleMode
+from kronfluence.module.tracked_module import ModuleMode, TrackedModule
 from kronfluence.module.utils import (
     accumulate_iterations,
     finalize_all_iterations,
@@ -30,7 +30,7 @@ from kronfluence.score.dot_product import (
     compute_dot_products_with_loader,
 )
 from kronfluence.task import Task
-from kronfluence.utils.constants import FACTOR_TYPE, PARTITION_TYPE, SCORE_TYPE
+from kronfluence.utils.constants import FACTOR_TYPE, PARTITION_TYPE, SCORE_TYPE, AGGREGATED_GRADIENT_NAME
 from kronfluence.utils.logger import TQDM_BAR_FORMAT
 from kronfluence.utils.state import State, no_sync
 
@@ -203,7 +203,7 @@ def compute_pairwise_scores_with_loaders(
     num_accumulations = 0
     enable_amp = score_args.amp_dtype is not None
     enable_grad_scaler = enable_amp and factor_args.amp_dtype == torch.float16
-    scaler = GradScaler(init_scale=factor_args.amp_scale, enabled=enable_grad_scaler)
+    scaler = GradScaler(device="cuda", init_scale=factor_args.amp_scale, enabled=enable_grad_scaler)
     if enable_grad_scaler:
         gradient_scale = 1.0 / scaler.get_scale()
         set_gradient_scale(model=model, gradient_scale=gradient_scale)
@@ -326,7 +326,7 @@ def compute_pairwise_query_aggregated_scores_with_loaders(
 
     enable_amp = score_args.amp_dtype is not None
     enable_grad_scaler = enable_amp and factor_args.amp_dtype == torch.float16
-    scaler = GradScaler(init_scale=factor_args.amp_scale, enabled=enable_grad_scaler)
+    scaler = GradScaler(device="cuda", init_scale=factor_args.amp_scale, enabled=enable_grad_scaler)
     if enable_grad_scaler:
         gradient_scale = 1.0 / scaler.get_scale()
         set_gradient_scale(model=model, gradient_scale=gradient_scale)
@@ -363,6 +363,141 @@ def compute_pairwise_query_aggregated_scores_with_loaders(
 
     if state.use_distributed:
         synchronize_modules(model=model, tracked_module_names=tracked_module_names)
+
+    set_mode(
+        model=model,
+        mode=ModuleMode.PRECONDITION_GRADIENT,
+        tracked_module_names=tracked_module_names,
+        release_memory=False,
+    )
+    finalize_all_iterations(model=model, tracked_module_names=tracked_module_names)
+
+    scores = dot_product_func(
+        model=model,
+        state=state,
+        task=task,
+        train_loader=train_loader,
+        factor_args=factor_args,
+        score_args=score_args,
+        tracked_module_names=tracked_module_names,
+        scaler=scaler,
+        disable_tqdm=disable_tqdm,
+    )
+
+    model.zero_grad(set_to_none=True)
+    if enable_grad_scaler:
+        set_gradient_scale(model=model, gradient_scale=1.0)
+    set_mode(model=model, mode=ModuleMode.DEFAULT, release_memory=True)
+    state.wait_for_everyone()
+
+    return scores
+
+
+def compute_pairwise_dual_query_aggregated_scores_with_loaders(
+    loaded_factors: FACTOR_TYPE,
+    model: nn.Module,
+    state: State,
+    task: Task,
+    pos_query_loader: data.DataLoader,
+    neg_query_loader: data.DataLoader,
+    train_loader: data.DataLoader,
+    score_args: ScoreArguments,
+    factor_args: FactorArguments,
+    tracked_module_names: Optional[List[str]],
+    disable_tqdm: bool = False,
+    per_device_query_batch_size: int = 0,
+) -> Dict[str, torch.Tensor]:
+    """Computes pairwise influence scores using the difference between two
+    aggregated query gradients.
+
+    The gradients from ``pos_query_loader`` and ``neg_query_loader`` are
+    aggregated separately, normalized by their respective dataset sizes, and
+    their difference is used for the pairwise score computation.
+    """
+    del per_device_query_batch_size
+    update_factor_args(model=model, factor_args=factor_args)
+    update_score_args(model=model, score_args=score_args)
+    if tracked_module_names is None:
+        tracked_module_names = get_tracked_module_names(model=model)
+
+    set_mode(
+        model=model,
+        mode=ModuleMode.GRADIENT_AGGREGATION,
+        tracked_module_names=tracked_module_names,
+        release_memory=True,
+    )
+    if len(loaded_factors) > 0:
+        for name in loaded_factors:
+            set_factors(model=model, factor_name=name, factors=loaded_factors[name], clone=True)
+    prepare_modules(model=model, tracked_module_names=tracked_module_names, device=state.device)
+
+    enable_amp = score_args.amp_dtype is not None
+    enable_grad_scaler = enable_amp and factor_args.amp_dtype == torch.float16
+    scaler = GradScaler(device="cuda", init_scale=factor_args.amp_scale, enabled=enable_grad_scaler)
+    if enable_grad_scaler:
+        gradient_scale = 1.0 / scaler.get_scale()
+        set_gradient_scale(model=model, gradient_scale=gradient_scale)
+
+    dot_product_func = (
+        compute_aggregated_dot_products_with_loader
+        if score_args.aggregate_train_gradients
+        else compute_dot_products_with_loader
+    )
+
+    def _aggregate_query_gradient(query_loader: data.DataLoader, desc: str) -> None:
+        with tqdm(
+            total=len(query_loader),
+            desc=desc,
+            bar_format=TQDM_BAR_FORMAT,
+            disable=not state.is_main_process or disable_tqdm,
+        ) as pbar:
+            for query_batch in query_loader:
+                query_batch = send_to_device(tensor=query_batch, device=state.device)
+
+                with no_sync(model=model, state=state):
+                    model.zero_grad(set_to_none=True)
+                    with autocast(device_type=state.device.type, enabled=enable_amp, dtype=score_args.amp_dtype):
+                        measurement = task.compute_measurement(batch=query_batch, model=model)
+                    scaler.scale(measurement).backward()
+
+                if factor_args.has_shared_parameters:
+                    finalize_iteration(model=model, tracked_module_names=tracked_module_names)
+
+                del measurement
+                pbar.update(1)
+
+    # Aggregate positive query gradient
+    _aggregate_query_gradient(pos_query_loader, "Computing positive query gradient")
+
+    if state.use_distributed:
+        synchronize_modules(model=model, tracked_module_names=tracked_module_names)
+
+    pos_grads: Dict[str, torch.Tensor] = {}
+    pos_size = len(pos_query_loader.dataset)
+    for module in model.modules():
+        if isinstance(module, TrackedModule) and module.name in tracked_module_names:
+            grad = module.get_factor(AGGREGATED_GRADIENT_NAME)
+            if grad is not None:
+                grad = grad.div(pos_size)
+                pos_grads[module.name] = grad.clone()
+            module.release_factor(AGGREGATED_GRADIENT_NAME)
+
+    # Aggregate negative query gradient
+    _aggregate_query_gradient(neg_query_loader, "Computing negative query gradient")
+
+    if state.use_distributed:
+        synchronize_modules(model=model, tracked_module_names=tracked_module_names)
+
+    neg_size = len(neg_query_loader.dataset)
+    for module in model.modules():
+        if isinstance(module, TrackedModule) and module.name in tracked_module_names:
+            neg_grad = module.get_factor(AGGREGATED_GRADIENT_NAME)
+            if neg_grad is not None:
+                neg_grad = neg_grad.div(neg_size)
+                diff_grad = pos_grads[module.name] - neg_grad
+            else:
+                diff_grad = pos_grads[module.name]
+            module.set_factor(AGGREGATED_GRADIENT_NAME, diff_grad)
 
     set_mode(
         model=model,

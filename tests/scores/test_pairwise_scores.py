@@ -19,7 +19,7 @@ from tests.utils import (
     check_tensor_dict_equivalence,
     custom_scores_name,
     prepare_model_and_analyzer,
-    prepare_test,
+    prepare_test
 )
 
 
@@ -976,3 +976,76 @@ def test_pairwise_query_batching(
 
     for i in range(query_size):
         assert spearmanr(scores[ALL_MODULE_NAME][i], qb_scores[ALL_MODULE_NAME][i])[0] > 0.9
+
+
+def test_dual_query_dataset() -> None:
+    model, train_dataset, pos_query_dataset, data_collator, task = prepare_test(
+        test_name="mlp",
+        query_size=4,
+        train_size=8,
+        seed=10,
+    )
+    _, _, negative_query_dataset, _, _ = prepare_test(
+        test_name="mlp",
+        query_size=4,
+        train_size=8,
+        seed=23,
+    )
+    kwargs = DataLoaderKwargs(collate_fn=data_collator)
+    model, analyzer = prepare_model_and_analyzer(model=model, task=task)
+
+    analyzer.fit_all_factors(
+        factors_name=DEFAULT_FACTORS_NAME,
+        dataset=train_dataset,
+        dataloader_kwargs=kwargs,
+        per_device_batch_size=8,
+        overwrite_output_dir=True,
+    )
+
+    score_args = pytest_score_arguments()
+    score_args.aggregate_query_gradients = True
+
+    analyzer.compute_pairwise_scores(
+        scores_name=custom_scores_name("pos"),
+        factors_name=DEFAULT_FACTORS_NAME,
+        query_dataset=pos_query_dataset,
+        per_device_query_batch_size=2,
+        train_dataset=train_dataset,
+        per_device_train_batch_size=4,
+        dataloader_kwargs=kwargs,
+        score_args=score_args,
+        overwrite_output_dir=True,
+    )
+    pos_scores = analyzer.load_pairwise_scores(scores_name=custom_scores_name("pos"))
+
+    analyzer.compute_pairwise_scores(
+        scores_name=custom_scores_name("neg"),
+        factors_name=DEFAULT_FACTORS_NAME,
+        query_dataset=negative_query_dataset,
+        per_device_query_batch_size=2,
+        train_dataset=train_dataset,
+        per_device_train_batch_size=4,
+        dataloader_kwargs=kwargs,
+        score_args=score_args,
+        overwrite_output_dir=True,
+    )
+    neg_scores = analyzer.load_pairwise_scores(scores_name=custom_scores_name("neg"))
+
+    analyzer.compute_pairwise_scores(
+        scores_name=DEFAULT_SCORES_NAME,
+        factors_name=DEFAULT_FACTORS_NAME,
+        query_dataset=pos_query_dataset,
+        negative_query_dataset=negative_query_dataset,
+        per_device_query_batch_size=2,
+        train_dataset=train_dataset,
+        per_device_train_batch_size=4,
+        dataloader_kwargs=kwargs,
+        score_args=score_args,
+        overwrite_output_dir=True,
+    )
+    diff_scores = analyzer.load_pairwise_scores(scores_name=DEFAULT_SCORES_NAME)
+
+    expected = pos_scores[ALL_MODULE_NAME] / len(pos_query_dataset) - neg_scores[ALL_MODULE_NAME] / len(
+        negative_query_dataset
+    )
+    assert torch.allclose(diff_scores[ALL_MODULE_NAME], expected, atol=ATOL, rtol=RTOL)
